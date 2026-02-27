@@ -1,0 +1,31 @@
+# ---- big datasets (BIDS / OpenNeuro) ----
+ds005307/
+**/.datalad/
+**/derivatives/
+
+# BrainVision EEG raw files (huge)
+**/*.eeg
+**/*.vhdr
+**/*.vmrk
+**/*.fif
+
+# Optional: ignore any other common EEG formats
+**/*.edf
+**/*.bdf
+**/*.set
+**/*.fdt
+**/*.cnt
+**/*.mff
+
+# ---- ML junk ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.DS_Store
+.ipynb_checkpoints/
+wandb/
+runs/
+checkpoints/
+logs/
