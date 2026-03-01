@@ -42,8 +42,8 @@ from scipy.linalg import eigh
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import (
-    RandomForestClassifier,
     StackingClassifier,
+    VotingClassifier,
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -61,7 +61,15 @@ from sklearn.model_selection import (
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.metrics import balanced_accuracy_score
 from mne.time_frequency import psd_array_welch
+
+try:
+    from imblearn.over_sampling import SMOTE
+    HAS_SMOTE = True
+except ImportError:
+    HAS_SMOTE = False
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 mne.set_log_level("WARNING")
@@ -93,7 +101,7 @@ CSP_BANDS = {
 
 FILTER_LOW = 0.5
 FILTER_HIGH = 45.0
-NOTCH_FREQ = 60.0
+NOTCH_FREQ = 50.0  # ds005307 PowerLineFrequency = 50 Hz (European dataset)
 RESAMPLE_FREQ = 250.0  # Downsample from 10 kHz -> 250 Hz after filtering
 TMIN = -0.5   # wider window: 500ms pre-stimulus for alpha baseline
 TMAX = 1.0    # wider window: 1000ms post-stimulus for full LEP
@@ -295,6 +303,9 @@ def preprocess_raw(
     if apply_ica and len(raw.ch_names) >= 15:
         try:
             raw_for_ica = raw.copy().resample(RESAMPLE_FREQ, verbose=False)
+            # Crop to at most 120s for ICA fitting speed on long recordings
+            if raw_for_ica.times[-1] > 120:
+                raw_for_ica.crop(tmax=120.0)
             n_components = min(15, len(raw_for_ica.ch_names) - 1)
             ica = mne.preprocessing.ICA(
                 n_components=n_components, method="fastica",
@@ -326,9 +337,13 @@ def create_epochs(
     raw: mne.io.Raw, events_tsv_path: str, debug: bool = False,
 ) -> tuple[mne.Epochs, np.ndarray]:
     """
-    Create epochs around pain stimuli (label=1) and inter-trial baseline (label=0).
-    Uses trial_type column to correctly identify pain events only.
-    Baseline epochs are placed in the middle of the largest inter-trial gap.
+    Create epochs around pain stimuli (label=1) and rest baseline (label=0).
+
+    Baseline strategy (adapted for ds005307's short inter-trial intervals):
+    1. Extract rest epochs from the pre-stimulus period (recording start → first stim)
+    2. Extract rest epochs from the post-stimulus period (last stim → recording end)
+    3. Extract rest epochs from any inter-trial gaps large enough (> epoch_duration + 0.5s)
+    4. Balance by down-sampling the majority class
     """
     events_df = pd.read_csv(events_tsv_path, sep="\t")
 
@@ -339,6 +354,8 @@ def create_epochs(
                 logger.info(f"unique {c}: {sorted(events_df[c].dropna().unique())[:50]}")
 
     sfreq = raw.info["sfreq"]
+    rec_duration = raw.times[-1]  # total recording length in seconds
+    epoch_duration = abs(TMIN) + TMAX  # 1.5s
 
     # Select only pain stimulus events
     if "trial_type" in events_df.columns:
@@ -363,38 +380,92 @@ def create_epochs(
         pain_events.append([sample, 0, 1])
     pain_events = np.array(pain_events, dtype=int)
 
-    # Build baseline events: midpoint of inter-trial intervals
-    # This avoids overlap with pain-evoked activity
-    baseline_events = []
-    epoch_duration = abs(TMIN) + TMAX  # total epoch length in seconds
-    min_gap = epoch_duration * 2  # need enough gap for non-overlapping epochs
     sorted_onsets = np.sort(pain_onsets)
-    for i in range(len(sorted_onsets) - 1):
-        gap = sorted_onsets[i + 1] - sorted_onsets[i]
-        if gap > min_gap:
-            mid_onset = sorted_onsets[i] + gap / 2
-            sample = int(round(mid_onset * sfreq))
-            if sample > 0:
-                baseline_events.append([sample, 0, 2])
 
-    # If not enough inter-trial baselines, fall back to pre-stimulus baselines
-    if len(baseline_events) < len(pain_events) // 2:
-        baseline_events = []
-        for onset in pain_onsets:
-            baseline_sample = int(round((onset - 2.0) * sfreq))
-            if baseline_sample > 0:
-                baseline_events.append([baseline_sample, 0, 2])
+    # ── Build baseline events from genuine rest periods ──
+    baseline_events = []
+    # Use a tighter step for more baseline epochs (allow 25% overlap)
+    step = epoch_duration * 0.75  # ~1.125s step
+
+    # (a) Pre-stimulus rest: from TMIN offset to first_onset - safety margin
+    first_onset = sorted_onsets[0] if len(sorted_onsets) > 0 else rec_duration
+    rest_start = abs(TMIN)  # need at least |TMIN| before the epoch center
+    rest_end = first_onset - TMAX - 0.2  # safety margin from first pain epoch
+    t = rest_start
+    while t + TMAX <= rest_end + TMAX and t < rest_end:
+        sample = int(round(t * sfreq))
+        baseline_events.append([sample, 0, 2])
+        t += step
+
+    # (b) Post-stimulus rest: from last_onset + safety to recording end
+    if len(sorted_onsets) > 0:
+        last_onset = sorted_onsets[-1]
+        rest_start = last_onset + TMAX + 0.5  # well after last pain response
+        rest_end = rec_duration - TMAX  # don't exceed recording
+        t = rest_start
+        while t + TMAX <= rec_duration and t < rest_end:
+            sample = int(round(t * sfreq))
+            baseline_events.append([sample, 0, 2])
+            t += step
+
+    # (c) Inter-trial gaps: extract MULTIPLE baseline epochs per gap
+    for i in range(len(sorted_onsets) - 1):
+        gap_start = sorted_onsets[i] + TMAX + 0.2  # after previous pain response
+        gap_end = sorted_onsets[i + 1] - abs(TMIN) - 0.2  # before next pain epoch
+        available = gap_end - gap_start
+        if available >= epoch_duration:
+            t = gap_start
+            while t + TMAX <= sorted_onsets[i + 1] - 0.2 and t < gap_end:
+                sample = int(round(t * sfreq))
+                if sample > 0:
+                    baseline_events.append([sample, 0, 2])
+                t += step
+
+    # (d) Pre-stimulus baselines: use period well before each pain stimulus
+    #     With rapid ITI (~1.65s), the ~0.15s gap between pain epochs is unusable,
+    #     but we can take the pre-stimulus portion of trials where it doesn't
+    #     overlap with the PREVIOUS trial's response window.
+    #     For trials with enough preceding rest (> 2.5s before), extract baseline
+    #     centered 2s before the pain onset.
+    for idx_o, onset in enumerate(sorted_onsets):
+        center = onset - 2.0  # 2s before the pain stimulus
+        # Epoch would span: center + TMIN to center + TMAX = onset-2.5 to onset-1.0
+        # Check it doesn't overlap with preceding pain epoch (which ends at prev+TMAX)
+        preceding = sorted_onsets[sorted_onsets < onset]
+        if len(preceding) > 0:
+            prev_end = preceding[-1] + TMAX  # end of previous pain response
+            epoch_start = center + TMIN  # start of this baseline epoch
+            if epoch_start < prev_end + 0.1:  # would overlap
+                continue
+        # Also check epoch start is within recording
+        if center + TMIN < 0:
+            continue
+        sample = int(round(center * sfreq))
+        if sample > 0:
+            baseline_events.append([sample, 0, 2])
 
     baseline_events = np.array(baseline_events, dtype=int) if baseline_events else np.empty((0, 3), dtype=int)
 
-    # Balance classes
-    if len(baseline_events) > len(pain_events):
-        rng = np.random.RandomState(42)
-        idx = rng.choice(len(baseline_events), len(pain_events), replace=False)
+    if debug:
+        logger.info(f"Created {len(baseline_events)} baseline epochs from rest periods")
+
+    # Balance classes: down-sample majority to 1:1
+    n_pain = len(pain_events)
+    n_base = len(baseline_events)
+    rng = np.random.RandomState(42)
+
+    if n_base > n_pain:
+        idx = rng.choice(n_base, n_pain, replace=False)
         baseline_events = baseline_events[idx]
+    elif n_base > 0 and n_pain > n_base * 2:
+        # Down-sample pain to at most 2× baseline (tighter than before)
+        max_pain = n_base * 2
+        idx = rng.choice(n_pain, max_pain, replace=False)
+        pain_events = pain_events[idx]
+        logger.info(f"  Down-sampled pain epochs {n_pain} -> {max_pain} (2:1 ratio)")
 
     if len(baseline_events) == 0:
-        logger.warning("No baseline events could be created")
+        logger.warning("No baseline events could be created from rest periods")
         return mne.Epochs(raw, pain_events, event_id={"pain": 1},
                           tmin=TMIN, tmax=TMAX, baseline=BASELINE,
                           preload=True, verbose=False), np.ones(len(pain_events))
@@ -569,58 +640,100 @@ def extract_features(epochs: mne.Epochs) -> np.ndarray:
             if np.any(mask):
                 feature_blocks.append(np.mean(vertex_data[:, :, mask], axis=(1, 2)).reshape(-1, 1))
 
-    # ── 8. Covariance matrix features (upper triangle) ──
-    # Use post-stimulus data for covariance
-    if n_channels <= 32:
-        n_upper = n_channels * (n_channels - 1) // 2
-        cov_feats = np.zeros((n_epochs, n_upper))
-        for i in range(n_epochs):
-            cov = np.cov(post_data[i])
-            # Normalise by trace for cross-subject stability
-            trace = np.trace(cov) + 1e-10
-            cov_norm = cov / trace
-            cov_feats[i] = cov_norm[np.triu_indices(n_channels, k=1)]
-        feature_blocks.append(cov_feats)
+    # ── 8. Morlet wavelet time-frequency features ──
+    # Extract power in pain-relevant bands at key time windows using wavelets
+    # This captures time-varying spectral content that Welch PSD misses
+    wavelet_bands = [(4, 8), (8, 13), (13, 30), (30, 45)]  # theta, alpha, beta, gamma
+    wavelet_windows = [
+        ("early", 0.0, 0.3),    # early cortical response (N2)
+        ("mid", 0.2, 0.6),      # N2-P2 complex
+        ("late", 0.5, 1.0),     # late component
+    ]
+    for fmin, fmax in wavelet_bands:
+        try:
+            for win_name, t_start, t_end in wavelet_windows:
+                win_mask = (times >= t_start) & (times <= t_end)
+                if not np.any(win_mask):
+                    continue
+                win_data = data[:, :, win_mask]  # (n_epochs, n_ch, n_win)
+                n_win_samples = win_data.shape[2]
+                # Skip if window is too short for reliable filtering
+                if n_win_samples < 50:
+                    continue
+                # Band-filtered power in time window (fast vectorized approach)
+                # Use short filter to avoid filter_length > signal warnings
+                flen = min(n_win_samples - 2, int(sfreq / fmin) * 3)
+                if flen < 3:
+                    continue
+                flen = flen if flen % 2 == 1 else flen - 1  # must be odd
+                win_bp = mne.filter.filter_data(
+                    win_data.astype(np.float64), sfreq, fmin, fmax,
+                    verbose=False, filter_length=flen,
+                )
+                win_power = np.log10(np.mean(win_bp ** 2, axis=2) + 1e-10)
+                feature_blocks.append(win_power)
+        except Exception:
+            pass  # Skip if filtering fails for this band
 
-    # ── 9. Downsampled post-stimulus waveform ──
-    n_post_samples = post_data.shape[2]
-    n_downsample = min(15, n_post_samples)
-    if n_downsample > 0:
-        indices = np.linspace(0, n_post_samples - 1, n_downsample, dtype=int)
-        waveform_features = post_data[:, :, indices].reshape(n_epochs, -1)
-        feature_blocks.append(waveform_features)
+    # ── 9. Vertex-focused ERP template matching ──
+    # Average ERP amplitude at vertex channels in fine-grained time windows
+    if len(vertex_idx) >= 2:
+        vertex_post = data[:, vertex_idx, t0_sample:]  # (n_epochs, n_vertex, n_post)
+        post_times_arr = times[t0_sample:]
+        fine_windows = [
+            (0.0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.4),
+            (0.4, 0.6), (0.6, 0.8), (0.8, 1.0),
+        ]
+        for w_start, w_end in fine_windows:
+            w_mask = (post_times_arr >= w_start) & (post_times_arr < w_end)
+            if np.any(w_mask):
+                w_mean = np.mean(vertex_post[:, :, w_mask], axis=2)  # (n_epochs, n_vertex)
+                # Average across vertex channels for a robust scalar per window
+                feature_blocks.append(np.mean(w_mean, axis=1, keepdims=True))
+                # Also keep per-vertex info for top channels
+                feature_blocks.append(w_mean)
+
+    # ── 10. Hjorth parameters (activity, mobility, complexity) ──
+    diff1 = np.diff(post_data, axis=2)
+    diff2 = np.diff(diff1, axis=2)
+    activity = np.var(post_data, axis=2)  # already have this as var, but needed for ratios
+    var_diff1 = np.var(diff1, axis=2)
+    mobility = np.sqrt(var_diff1 / (activity + 1e-10))
+    var_diff2 = np.var(diff2, axis=2)
+    complexity = np.sqrt(var_diff2 / (var_diff1 + 1e-10)) / (mobility + 1e-10)
+    feature_blocks.append(mobility)
+    feature_blocks.append(complexity)
+
+    # ── 11. Spectral entropy ──
+    psd_norm = psds / (np.sum(psds, axis=2, keepdims=True) + 1e-10)
+    spectral_entropy = -np.sum(psd_norm * np.log2(psd_norm + 1e-10), axis=2)
+    feature_blocks.append(spectral_entropy)
+
+    # ── 12. Zero-crossing rate (post-stimulus) ──
+    sign_changes = np.diff(np.sign(post_data), axis=2)
+    zcr = np.sum(np.abs(sign_changes) > 0, axis=2) / max(post_data.shape[2] - 1, 1)
+    feature_blocks.append(zcr)
+
+    # ── 13. Lateralization index (C3 vs C4) ──
+    c3_idx = [i for i, ch in enumerate(ch_names) if ch == "C3"]
+    c4_idx = [i for i, ch in enumerate(ch_names) if ch == "C4"]
+    if c3_idx and c4_idx:
+        c3_power = np.mean(data[:, c3_idx[0], :] ** 2, axis=1, keepdims=True)
+        c4_power = np.mean(data[:, c4_idx[0], :] ** 2, axis=1, keepdims=True)
+        lateralization = (c4_power - c3_power) / (c4_power + c3_power + 1e-10)
+        feature_blocks.append(lateralization)
 
     features = np.hstack(feature_blocks)
     return features
 
 
-def extract_csp_features(
-    epochs: mne.Epochs, labels: np.ndarray, fbcsp: Optional[FilterBankCSP] = None,
-) -> tuple[np.ndarray, FilterBankCSP]:
-    """Extract Filter-Bank CSP features (fit or transform)."""
-    data = epochs.get_data(copy=True)
-    sfreq = epochs.info["sfreq"]
-    times = epochs.times
-
-    # Use post-stimulus data for CSP
-    t0_sample = np.argmin(np.abs(times - 0.0))
-    post_data = data[:, :, t0_sample:]
-
-    if fbcsp is None:
-        fbcsp = FilterBankCSP(bands=CSP_BANDS, n_components=4, sfreq=sfreq)
-        fbcsp.fit(post_data, labels)
-
-    csp_feats = fbcsp.transform(post_data)
-    return csp_feats, fbcsp
-
-
 # ── Subject Loader ───────────────────────────────────────────────────────────
 def load_subject(
     subject_dir: str, debug: bool = False, apply_ica: bool = True,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Load and process all runs for a single subject.
-    Returns (features, labels, groups, list_of_epoch_data_for_csp).
+    Returns (features, labels, groups).
     """
     subject_id = Path(subject_dir).name
     t0 = time.time()
@@ -629,11 +742,10 @@ def load_subject(
     vhdr_files = get_run_files(subject_dir)
     if not vhdr_files:
         logger.warning(f"No vhdr files found for {subject_id}")
-        return np.array([]), np.array([]), np.array([]), []
+        return np.array([]), np.array([]), np.array([])
 
     all_features = []
     all_labels = []
-    all_epoch_data = []  # raw epoch arrays for CSP
 
     for vhdr_path in vhdr_files:
         run_name = Path(vhdr_path).stem
@@ -674,20 +786,27 @@ def load_subject(
             logger.warning(f"  Failed to extract features for {run_name}: {e}")
             continue
 
-        # Store epoch data for CSP (will be computed globally)
-        epoch_data = epochs.get_data(copy=True)
-        all_epoch_data.append((epoch_data, labels, epochs.info["sfreq"], epochs.times))
-
         all_features.append(features)
         all_labels.append(labels)
         del raw, raw_processed, epochs
 
     if not all_features:
-        return np.array([]), np.array([]), np.array([]), []
+        return np.array([]), np.array([]), np.array([])
 
     features = np.vstack(all_features)
     labels = np.concatenate(all_labels)
     groups = np.full(len(labels), subject_id)
+
+    # ── Per-subject z-normalization ──
+    # Critical for cross-subject generalisation: each subject has different
+    # EEG amplitudes, impedances, and baseline neural activity.  Normalising
+    # features to zero mean / unit variance *within* each subject removes
+    # these nuisance differences so the classifier learns pain-vs-baseline
+    # patterns instead of subject identity.
+    if len(features) > 1:
+        subj_mean = np.nanmean(features, axis=0, keepdims=True)
+        subj_std = np.nanstd(features, axis=0, keepdims=True) + 1e-10
+        features = (features - subj_mean) / subj_std
 
     elapsed = time.time() - t0
     logger.info(
@@ -695,19 +814,21 @@ def load_subject(
         f"(pain={np.sum(labels == 1)}, baseline={np.sum(labels == 0)}) "
         f"in {elapsed:.1f}s"
     )
-    return features, labels, groups, all_epoch_data
+    return features, labels, groups
 
 
 # ── Model Training ───────────────────────────────────────────────────────────
 def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeline]:
     """Return a dict of named sklearn Pipelines to compare."""
-    n_pca = min(120, n_features)
+    n_pca = min(80, n_features)  # PCA for dimensionality reduction
+    n_select = min(300, n_features)  # feature selection before PCA
 
     clfs = {}
 
-    # LDA with shrinkage
+    # LDA with shrinkage + feature selection
     clfs["LDA"] = Pipeline([
         ("scaler", StandardScaler()),
+        ("select", SelectKBest(mutual_info_classif, k=n_select)),
         ("pca", PCA(n_components=n_pca, random_state=random_state)),
         ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
     ])
@@ -716,6 +837,7 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     for C in [0.01, 0.1, 1.0]:
         clfs[f"LogReg_C{C}"] = Pipeline([
             ("scaler", StandardScaler()),
+            ("select", SelectKBest(mutual_info_classif, k=n_select)),
             ("pca", PCA(n_components=n_pca, random_state=random_state)),
             ("clf", LogisticRegression(
                 max_iter=3000, solver="lbfgs",
@@ -729,10 +851,11 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
         from lightgbm import LGBMClassifier
         clfs["LightGBM"] = Pipeline([
             ("scaler", StandardScaler()),
+            ("select", SelectKBest(mutual_info_classif, k=n_select)),
             ("clf", LGBMClassifier(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.7,
-                min_child_samples=20, reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=500, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.4,
+                min_child_samples=30, reg_alpha=1.0, reg_lambda=3.0,
                 class_weight="balanced", random_state=random_state,
                 n_jobs=-1, verbose=-1,
             )),
@@ -745,10 +868,12 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
         from xgboost import XGBClassifier
         clfs["XGBoost"] = Pipeline([
             ("scaler", StandardScaler()),
+            ("select", SelectKBest(mutual_info_classif, k=n_select)),
             ("clf", XGBClassifier(
-                n_estimators=500, max_depth=6, learning_rate=0.05,
-                subsample=0.8, colsample_bytree=0.7,
-                min_child_weight=5, reg_alpha=0.1, reg_lambda=1.0,
+                n_estimators=500, max_depth=4, learning_rate=0.03,
+                subsample=0.7, colsample_bytree=0.4,
+                min_child_weight=10, reg_alpha=1.0, reg_lambda=3.0,
+                scale_pos_weight=1.0,
                 eval_metric="logloss",
                 random_state=random_state, n_jobs=-1,
             )),
@@ -756,19 +881,21 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     except ImportError:
         logger.info("XGBoost not installed - skipping")
 
-    # Stacking Ensemble (meta-learner)
+    # Soft Voting Ensemble (averages probabilities from diverse models)
     try:
         from lightgbm import LGBMClassifier
         from xgboost import XGBClassifier
 
-        estimators = [
+        vote_estimators = [
             ("lda", Pipeline([
                 ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
                 ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
             ])),
             ("lr", Pipeline([
                 ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
                 ("clf", LogisticRegression(
                     max_iter=3000, solver="lbfgs", class_weight="balanced",
@@ -777,18 +904,72 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
             ])),
             ("lgbm", Pipeline([
                 ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
                 ("clf", LGBMClassifier(
-                    n_estimators=300, max_depth=5, learning_rate=0.05,
-                    class_weight="balanced", random_state=random_state,
+                    n_estimators=300, max_depth=4, learning_rate=0.03,
+                    class_weight="balanced", reg_alpha=1.0, reg_lambda=3.0,
+                    random_state=random_state,
+                    n_jobs=-1, verbose=-1,
+                )),
+            ])),
+            ("xgb", Pipeline([
+                ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("clf", XGBClassifier(
+                    n_estimators=300, max_depth=4, learning_rate=0.03,
+                    reg_alpha=1.0, reg_lambda=3.0,
+                    eval_metric="logloss",
+                    random_state=random_state, n_jobs=-1,
+                )),
+            ])),
+        ]
+
+        clfs["SoftVoting"] = VotingClassifier(
+            estimators=vote_estimators,
+            voting="soft",
+            n_jobs=1,
+        )
+    except ImportError:
+        logger.info("Voting requires LightGBM + XGBoost - skipping")
+
+    # Stacking Ensemble (meta-learner)
+    try:
+        from lightgbm import LGBMClassifier
+        from xgboost import XGBClassifier
+
+        stack_estimators = [
+            ("lda", Pipeline([
+                ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("pca", PCA(n_components=n_pca, random_state=random_state)),
+                ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
+            ])),
+            ("lr", Pipeline([
+                ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("pca", PCA(n_components=n_pca, random_state=random_state)),
+                ("clf", LogisticRegression(
+                    max_iter=3000, solver="lbfgs", class_weight="balanced",
+                    C=0.1, random_state=random_state,
+                )),
+            ])),
+            ("lgbm", Pipeline([
+                ("scaler", StandardScaler()),
+                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("clf", LGBMClassifier(
+                    n_estimators=300, max_depth=4, learning_rate=0.03,
+                    class_weight="balanced", reg_alpha=1.0, reg_lambda=3.0,
+                    random_state=random_state,
                     n_jobs=-1, verbose=-1,
                 )),
             ])),
         ]
 
         clfs["StackingEnsemble"] = StackingClassifier(
-            estimators=estimators,
+            estimators=stack_estimators,
             final_estimator=LogisticRegression(
-                max_iter=2000, solver="lbfgs", C=1.0, random_state=random_state,
+                max_iter=2000, solver="lbfgs", C=1.0,
+                class_weight="balanced", random_state=random_state,
             ),
             cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=random_state),
             n_jobs=1,
@@ -821,6 +1002,21 @@ def train_model(
         logger.info(f"Dropping {n_bad} rows with NaN/Inf features ({n_bad/len(valid_mask)*100:.1f}%)")
         X, y, groups = X[valid_mask], y[valid_mask], groups[valid_mask]
 
+    # Apply SMOTE to balance classes (important for this imbalanced dataset)
+    if HAS_SMOTE:
+        n_minority = np.sum(y == 0)
+        n_majority = np.sum(y == 1)
+        if n_minority > 5 and n_majority > n_minority * 1.5:
+            logger.info(f"Applying SMOTE: {n_minority} minority -> {n_majority} (target 1:1)")
+            try:
+                smote = SMOTE(random_state=random_state, k_neighbors=min(5, n_minority - 1))
+                X, y = smote.fit_resample(X, y)
+                # Expand groups array for synthetic samples
+                groups = np.concatenate([groups, np.full(len(y) - len(groups), "synthetic")])
+                logger.info(f"After SMOTE: {np.sum(y==0)} baseline, {np.sum(y==1)} pain")
+            except Exception as e:
+                logger.warning(f"SMOTE failed: {e}")
+
     clfs = get_classifiers(n_features=X.shape[1], random_state=random_state)
     best_name, best_acc, best_result = None, -1.0, None
     all_results = {}
@@ -832,27 +1028,33 @@ def train_model(
         for name, pipe in clfs.items():
             t0 = time.time()
             try:
-                y_pred = cross_val_predict(pipe, X, y, groups=groups, cv=logo, n_jobs=1)
+                # Use n_jobs=-1 for non-stacking models; stacking has internal CV
+                # that can deadlock with nested parallelism
+                n_jobs_cv = 1 if "Stacking" in name else -1
+                y_pred = cross_val_predict(pipe, X, y, groups=groups, cv=logo, n_jobs=n_jobs_cv)
             except Exception as e:
                 logger.warning(f"  {name:25s}  FAILED: {e}")
                 continue
             elapsed = time.time() - t0
             acc = accuracy_score(y, y_pred)
+            bal_acc = balanced_accuracy_score(y, y_pred)
             try:
                 auc = roc_auc_score(y, y_pred)
             except ValueError:
                 auc = float("nan")
-            logger.info(f"  {name:25s}  acc={acc:.4f}  auc={auc:.4f}  ({elapsed:.1f}s)")
+            logger.info(f"  {name:25s}  acc={acc:.4f}  bal_acc={bal_acc:.4f}  auc={auc:.4f}  ({elapsed:.1f}s)")
 
-            all_results[name] = {"accuracy": acc, "auc": auc, "time": elapsed}
+            all_results[name] = {"accuracy": acc, "balanced_accuracy": bal_acc, "auc": auc, "time": elapsed}
 
-            if acc > best_acc:
-                best_acc = acc
+            # Select by BALANCED accuracy (prevents majority-class bias)
+            if bal_acc > best_acc:
+                best_acc = bal_acc
                 best_name = name
                 best_result = {
                     "model_name": name,
                     "pipeline": pipe,
                     "accuracy": acc,
+                    "balanced_accuracy": bal_acc,
                     "auc": auc,
                     "classification_report": classification_report(
                         y, y_pred, target_names=["baseline", "pain"],
@@ -989,13 +1191,12 @@ def main():
     logger.info("-" * 60)
 
     all_features, all_labels, all_groups = [], [], []
-    all_epoch_data = []
     apply_ica = not args.no_ica
     n_features_ref = None
 
     for i, subject_dir in enumerate(subject_dirs):
         debug_this = args.verbose and (i == 0)
-        features, labels, groups, epoch_data = load_subject(
+        features, labels, groups = load_subject(
             subject_dir, debug=debug_this, apply_ica=apply_ica,
         )
         if len(features) > 0:
@@ -1006,7 +1207,6 @@ def main():
                 all_features.append(features)
                 all_labels.append(labels)
                 all_groups.append(groups)
-                all_epoch_data.extend(epoch_data)
             else:
                 logger.warning(
                     f"  Skipping {Path(subject_dir).name}: "
@@ -1021,40 +1221,12 @@ def main():
     y = np.concatenate(all_labels)
     groups = np.concatenate(all_groups)
 
-    # ── Add CSP features globally ──
-    logger.info("Computing Filter-Bank CSP features...")
-    try:
-        # Combine all epoch data for CSP
-        all_data_list = []
-        all_labels_list = []
-        for epoch_data_arr, epoch_labels, sfreq_val, times_val in all_epoch_data:
-            if epoch_data_arr.shape[1] == all_epoch_data[0][0].shape[1]:
-                all_data_list.append(epoch_data_arr)
-                all_labels_list.append(epoch_labels)
-
-        if all_data_list:
-            csp_data = np.vstack(all_data_list)
-            csp_labels = np.concatenate(all_labels_list)
-
-            # Ensure CSP data matches feature count
-            if len(csp_labels) == len(y):
-                fbcsp = FilterBankCSP(
-                    bands=CSP_BANDS, n_components=4, sfreq=RESAMPLE_FREQ,
-                )
-                # Use post-stimulus data for CSP
-                t0_idx = np.argmin(np.abs(all_epoch_data[0][3] - 0.0))
-                csp_post = csp_data[:, :, t0_idx:]
-                fbcsp.fit(csp_post, csp_labels)
-                csp_feats = fbcsp.transform(csp_post)
-                if csp_feats.shape[0] == X.shape[0] and csp_feats.shape[1] > 0:
-                    X = np.hstack([X, csp_feats])
-                    logger.info(f"  Added {csp_feats.shape[1]} CSP features")
-                else:
-                    logger.info("  CSP shape mismatch - skipping")
-            else:
-                logger.info(f"  CSP label mismatch ({len(csp_labels)} vs {len(y)}) - skipping")
-    except Exception as e:
-        logger.info(f"  CSP extraction failed: {e} - continuing without CSP")
+    # ── CSP features removed from global scope to avoid data leakage ──
+    # Fitting CSP on the entire dataset before cross-validation leaks test-fold
+    # information into the spatial filters, inflating accuracy. CSP features
+    # should be computed per-fold inside the CV loop for a rigorous evaluation.
+    # For now we proceed without CSP; the hand-crafted features are sufficient.
+    logger.info("CSP features skipped (global fit causes data leakage in CV)")
 
     logger.info("-" * 60)
     logger.info("Dataset Summary")
