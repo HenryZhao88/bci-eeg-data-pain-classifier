@@ -1,0 +1,18 @@
+{
+    "TaskName": "expsupp",
+    "Manufacturer": "BrainProducts",
+    "PowerLineFrequency": 50.0,
+    "SamplingFrequency": 2000.0,
+    "SoftwareFilters": "n/a",
+    "RecordingDuration": 302.6355,
+    "RecordingType": "continuous",
+    "EEGReference": "nose",
+    "EEGGround": "POz",
+    "EEGPlacementScheme": "based on the extended 10/20 system",
+    "EEGChannelCount": 32,
+    "EOGChannelCount": 2,
+    "ECGChannelCount": 0,
+    "EMGChannelCount": 0,
+    "MiscChannelCount": 0,
+    "TriggerChannelCount": 0
+}

@@ -1,0 +1,13 @@
+{
+    "SamplingFrequency": 1000.0,
+    "StartTime": -3.1485,
+    "Columns": [
+        "xpos_right",
+        "ypos_right",
+        "pupil_right",
+        "event_trigger",
+        "pupil_right_raw",
+        "interpolated_bool"
+    ],
+    "ColumnsExplained": "xpos_right = X coordinate on screen, right eye; ypos_right = Y coordinate on screen, right eye; pupil_right = Pupil size (a.u.), right eye, software detected blinks linearly interpolated using 0.05s before and 0.2s after a blink as buffer; event_trigger = Event onsets as also described in events.tsv; pupil_right_raw = Pupil size, right eye, without interpolation of blinks interpolated_bool = Whether this data point has been interpolated"
+}
