@@ -80,35 +80,53 @@ logger = logging.getLogger(__name__)
 DEFAULT_TEST_SUBJECTS = ["sub-esg04", "sub-esg05"]
 
 
-def load_all_subjects(data_dir: str, apply_ica: bool = True):
-    """Load features, labels, and group IDs for every subject."""
-    subject_dirs = get_subject_dirs(data_dir)
-    if not subject_dirs:
-        logger.error("No subject directories found")
+def load_all_subjects(data_dir: str, apply_ica: bool = True,
+                      extra_data_dirs: list = None):
+    """Load features, labels, and group IDs for every subject.
+
+    extra_data_dirs: additional dataset directories (e.g. ds006374) whose
+    subjects are used exclusively for training (never for the held-out test).
+    """
+    all_dirs = [(data_dir, get_subject_dirs(data_dir))]
+    if extra_data_dirs:
+        for extra_dir in extra_data_dirs:
+            extra_subject_dirs = get_subject_dirs(extra_dir)
+            if extra_subject_dirs:
+                logger.info(f"  Extra dataset {extra_dir}: "
+                            f"{len(extra_subject_dirs)} subjects")
+                all_dirs.append((extra_dir, extra_subject_dirs))
+            else:
+                logger.warning(f"  No subjects found in extra_data_dir: {extra_dir}")
+
+    primary_dirs = all_dirs[0][1]
+    if not primary_dirs:
+        logger.error("No subject directories found in primary data_dir")
         sys.exit(1)
 
     all_features, all_labels, all_groups = [], [], []
     n_features_ref = None
 
-    for i, subject_dir in enumerate(subject_dirs):
-        features, labels, groups = load_subject(
-            subject_dir, debug=(i == 0), apply_ica=apply_ica,
-        )
-        if len(features) == 0:
-            continue
-
-        if n_features_ref is None:
-            n_features_ref = features.shape[1]
-
-        if features.shape[1] == n_features_ref:
-            all_features.append(features)
-            all_labels.append(labels)
-            all_groups.append(groups)
-        else:
-            logger.warning(
-                f"  Skipping {Path(subject_dir).name}: "
-                f"feature dim {features.shape[1]} != expected {n_features_ref}"
+    for dataset_dir, subject_dirs in all_dirs:
+        is_primary = (dataset_dir == data_dir)
+        for i, subject_dir in enumerate(subject_dirs):
+            features, labels, groups = load_subject(
+                subject_dir, debug=(is_primary and i == 0), apply_ica=apply_ica,
             )
+            if len(features) == 0:
+                continue
+
+            if n_features_ref is None:
+                n_features_ref = features.shape[1]
+
+            if features.shape[1] == n_features_ref:
+                all_features.append(features)
+                all_labels.append(labels)
+                all_groups.append(groups)
+            else:
+                logger.warning(
+                    f"  Skipping {Path(subject_dir).name}: "
+                    f"feature dim {features.shape[1]} != expected {n_features_ref}"
+                )
 
     if not all_features:
         logger.error("No valid data loaded from any subject")
@@ -151,7 +169,10 @@ def run_benchmark(args):
     # ── 1. Load all subjects ─────────────────────────────────────────────
     logger.info("\n[1/5] Loading & preprocessing all subjects...")
     apply_ica = not args.no_ica
-    X_all, y_all, g_all = load_all_subjects(args.data_dir, apply_ica=apply_ica)
+    extra_dirs = getattr(args, "extra_data_dirs", None) or []
+    X_all, y_all, g_all = load_all_subjects(
+        args.data_dir, apply_ica=apply_ica, extra_data_dirs=extra_dirs
+    )
 
     unique_subjects = sorted(np.unique(g_all))
     logger.info(f"  Loaded subjects: {unique_subjects}")
@@ -255,9 +276,9 @@ def run_benchmark(args):
         # are very close — complex models (Stacking) tend to overfit on CV
         complexity_penalty = {
             "StackingEnsemble": 0.01,
-            "SoftVoting": 0.005,
-            "LightGBM": 0.003,
-            "XGBoost": 0.003,
+            "SoftVoting": 0.003,
+            "LightGBM": 0.002,
+            "XGBoost": 0.002,
         }
         penalty = complexity_penalty.get(name, 0.0)
         adjusted_bal_acc = bal_acc - penalty
@@ -441,6 +462,11 @@ def main():
     parser.add_argument(
         "--no_ica", action="store_true",
         help="Disable ICA artifact removal (faster)",
+    )
+    parser.add_argument(
+        "--extra_data_dirs", nargs="+", default=[],
+        help="Additional dataset directories to include as training-only subjects "
+             "(e.g. ds006374). These subjects are NEVER used as test subjects.",
     )
     args = parser.parse_args()
 

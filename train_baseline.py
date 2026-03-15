@@ -42,10 +42,13 @@ from scipy.linalg import eigh
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import (
+    ExtraTreesClassifier,
+    RandomForestClassifier,
     StackingClassifier,
     VotingClassifier,
 )
 from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -61,9 +64,10 @@ from sklearn.model_selection import (
 from sklearn.decomposition import PCA
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.feature_selection import SelectKBest, f_classif, mutual_info_classif
 from sklearn.metrics import balanced_accuracy_score
 from mne.time_frequency import psd_array_welch
+from scipy.signal import hilbert as scipy_hilbert
 
 try:
     from imblearn.over_sampling import SMOTE
@@ -111,6 +115,9 @@ BASELINE = (-0.5, -0.1)  # Pre-stimulus baseline correction
 REJECT = dict(eeg=150e-6)  # 150 µV
 
 PAIN_KEYWORDS = ["pain", "laser", "nociceptive", "stimulus", "stim"]
+# ds006374 uses "repetition" in trial_type for actual laser deliveries
+DS006374_PAIN_KEYWORD = "repetition"
+DS006374_SECOND_STIM = "2nd"  # use 2nd stimulus only to avoid overlap with 1st
 
 NON_EEG_CHANNELS = [
     "VEOG", "HEOG", "EOG", "ECG", "Biceps", "Resp", "STI 014", "STI014",
@@ -359,10 +366,25 @@ def create_epochs(
 
     # Select only pain stimulus events
     if "trial_type" in events_df.columns:
-        pain_mask = events_df["trial_type"].str.lower().str.contains(
-            "|".join(PAIN_KEYWORDS), na=False,
+        # Auto-detect ds006374 format: trial_type contains "repetition" and "2nd"
+        # This dataset uses paired stimuli; we use only the 2nd to avoid epoch overlap
+        ds006374_mask = (
+            events_df["trial_type"].str.contains(DS006374_SECOND_STIM, na=False)
+            & events_df["trial_type"].str.contains(DS006374_PAIN_KEYWORD, na=False)
         )
-        pain_df = events_df[pain_mask]
+        if ds006374_mask.any() and not events_df["trial_type"].str.lower().str.contains(
+            "|".join(PAIN_KEYWORDS), na=False
+        ).any():
+            # ds006374-style dataset: "2nd/repetition/..." events are pain
+            pain_df = events_df[ds006374_mask]
+            if debug:
+                logger.info(f"  Auto-detected ds006374 format: "
+                            f"{len(pain_df)} '2nd/repetition' events as pain")
+        else:
+            pain_mask = events_df["trial_type"].str.lower().str.contains(
+                "|".join(PAIN_KEYWORDS), na=False,
+            )
+            pain_df = events_df[pain_mask]
     else:
         logger.warning("No trial_type column - using all events as pain stimuli")
         pain_df = events_df
@@ -723,6 +745,35 @@ def extract_features(epochs: mne.Epochs) -> np.ndarray:
         lateralization = (c4_power - c3_power) / (c4_power + c3_power + 1e-10)
         feature_blocks.append(lateralization)
 
+    # ── 14. Phase Locking Value (PLV) connectivity features ──
+    # PLV captures inter-channel phase synchronisation — a key pain biomarker.
+    # We compute PLV in alpha (8-13 Hz) and beta (13-30 Hz) bands over the
+    # post-stimulus window for key electrode pairs relevant to pain processing.
+    key_pairs = [
+        ("Cz", "FCz"), ("Cz", "Fz"), ("Cz", "C3"), ("Cz", "C4"),
+        ("Cz", "Pz"), ("FCz", "Fz"), ("FCz", "C3"), ("C3", "C4"),
+    ]
+    valid_pairs = [(c1, c2) for c1, c2 in key_pairs
+                   if c1 in ch_names and c2 in ch_names]
+    if valid_pairs and post_data.shape[2] >= 50:
+        for fmin_plv, fmax_plv in [(8, 13), (13, 30)]:
+            try:
+                plv_filt = mne.filter.filter_data(
+                    post_data.astype(np.float64), sfreq, fmin_plv, fmax_plv,
+                    verbose=False,
+                )
+                analytic = scipy_hilbert(plv_filt, axis=2)
+                phase = np.angle(analytic)  # (n_epochs, n_channels, n_times)
+                for c1_name, c2_name in valid_pairs:
+                    ci = ch_names.index(c1_name)
+                    cj = ch_names.index(c2_name)
+                    plv = np.abs(
+                        np.mean(np.exp(1j * (phase[:, ci, :] - phase[:, cj, :])), axis=1)
+                    )
+                    feature_blocks.append(plv.reshape(-1, 1))
+            except Exception:
+                pass
+
     features = np.hstack(feature_blocks)
     return features
 
@@ -822,13 +873,14 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     """Return a dict of named sklearn Pipelines to compare."""
     n_pca = min(80, n_features)  # PCA for dimensionality reduction
     n_select = min(300, n_features)  # feature selection before PCA
+    n_select_tree = min(150, n_features)  # fewer features for tree models (less overfit)
 
     clfs = {}
 
     # LDA with shrinkage + feature selection
     clfs["LDA"] = Pipeline([
         ("scaler", StandardScaler()),
-        ("select", SelectKBest(mutual_info_classif, k=n_select)),
+        ("select", SelectKBest(f_classif, k=n_select)),
         ("pca", PCA(n_components=n_pca, random_state=random_state)),
         ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
     ])
@@ -837,7 +889,7 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     for C in [0.01, 0.1, 1.0]:
         clfs[f"LogReg_C{C}"] = Pipeline([
             ("scaler", StandardScaler()),
-            ("select", SelectKBest(mutual_info_classif, k=n_select)),
+            ("select", SelectKBest(f_classif, k=n_select)),
             ("pca", PCA(n_components=n_pca, random_state=random_state)),
             ("clf", LogisticRegression(
                 max_iter=3000, solver="lbfgs",
@@ -846,16 +898,48 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
             )),
         ])
 
-    # LightGBM
+    # SVM with RBF kernel — strong baseline for EEG BCI
+    clfs["SVM_RBF"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("select", SelectKBest(f_classif, k=n_select)),
+        ("pca", PCA(n_components=n_pca, random_state=random_state)),
+        ("clf", SVC(
+            kernel="rbf", C=5.0, gamma="scale",
+            probability=True, class_weight="balanced",
+            random_state=random_state,
+        )),
+    ])
+
+    # Random Forest — robust to noisy EEG features
+    clfs["RandomForest"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("select", SelectKBest(f_classif, k=n_select_tree)),
+        ("clf", RandomForestClassifier(
+            n_estimators=500, max_depth=8, min_samples_leaf=5,
+            class_weight="balanced", random_state=random_state, n_jobs=-1,
+        )),
+    ])
+
+    # Extra Trees — fast, low-variance ensemble
+    clfs["ExtraTrees"] = Pipeline([
+        ("scaler", StandardScaler()),
+        ("select", SelectKBest(f_classif, k=n_select_tree)),
+        ("clf", ExtraTreesClassifier(
+            n_estimators=500, max_depth=8, min_samples_leaf=5,
+            class_weight="balanced", random_state=random_state, n_jobs=-1,
+        )),
+    ])
+
+    # LightGBM — moderately regularised for small EEG datasets
     try:
         from lightgbm import LGBMClassifier
         clfs["LightGBM"] = Pipeline([
             ("scaler", StandardScaler()),
-            ("select", SelectKBest(mutual_info_classif, k=n_select)),
+            ("select", SelectKBest(f_classif, k=n_select_tree)),
             ("clf", LGBMClassifier(
-                n_estimators=500, max_depth=4, learning_rate=0.03,
-                subsample=0.7, colsample_bytree=0.4,
-                min_child_samples=30, reg_alpha=1.0, reg_lambda=3.0,
+                n_estimators=600, max_depth=5, learning_rate=0.02,
+                subsample=0.8, colsample_bytree=0.6,
+                min_child_samples=20, reg_alpha=0.5, reg_lambda=1.5,
                 class_weight="balanced", random_state=random_state,
                 n_jobs=-1, verbose=-1,
             )),
@@ -863,16 +947,16 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     except ImportError:
         logger.info("LightGBM not installed - skipping")
 
-    # XGBoost
+    # XGBoost — moderately regularised for small EEG datasets
     try:
         from xgboost import XGBClassifier
         clfs["XGBoost"] = Pipeline([
             ("scaler", StandardScaler()),
-            ("select", SelectKBest(mutual_info_classif, k=n_select)),
+            ("select", SelectKBest(f_classif, k=n_select_tree)),
             ("clf", XGBClassifier(
-                n_estimators=500, max_depth=4, learning_rate=0.03,
-                subsample=0.7, colsample_bytree=0.4,
-                min_child_weight=10, reg_alpha=1.0, reg_lambda=3.0,
+                n_estimators=600, max_depth=5, learning_rate=0.02,
+                subsample=0.8, colsample_bytree=0.6,
+                min_child_weight=5, reg_alpha=0.5, reg_lambda=1.5,
                 scale_pos_weight=1.0,
                 eval_metric="logloss",
                 random_state=random_state, n_jobs=-1,
@@ -881,7 +965,7 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
     except ImportError:
         logger.info("XGBoost not installed - skipping")
 
-    # Soft Voting Ensemble (averages probabilities from diverse models)
+    # Soft Voting Ensemble — diverse models: linear, kernel, tree, boosting
     try:
         from lightgbm import LGBMClassifier
         from xgboost import XGBClassifier
@@ -889,37 +973,36 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
         vote_estimators = [
             ("lda", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
                 ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
             ])),
-            ("lr", Pipeline([
+            ("svm", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
-                ("clf", LogisticRegression(
-                    max_iter=3000, solver="lbfgs", class_weight="balanced",
-                    C=0.1, random_state=random_state,
+                ("clf", SVC(
+                    kernel="rbf", C=5.0, gamma="scale",
+                    probability=True, class_weight="balanced",
+                    random_state=random_state,
                 )),
             ])),
             ("lgbm", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select_tree)),
                 ("clf", LGBMClassifier(
-                    n_estimators=300, max_depth=4, learning_rate=0.03,
-                    class_weight="balanced", reg_alpha=1.0, reg_lambda=3.0,
-                    random_state=random_state,
-                    n_jobs=-1, verbose=-1,
+                    n_estimators=400, max_depth=5, learning_rate=0.02,
+                    subsample=0.8, colsample_bytree=0.6,
+                    class_weight="balanced", reg_alpha=0.5, reg_lambda=1.5,
+                    random_state=random_state, n_jobs=-1, verbose=-1,
                 )),
             ])),
-            ("xgb", Pipeline([
+            ("rf", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
-                ("clf", XGBClassifier(
-                    n_estimators=300, max_depth=4, learning_rate=0.03,
-                    reg_alpha=1.0, reg_lambda=3.0,
-                    eval_metric="logloss",
-                    random_state=random_state, n_jobs=-1,
+                ("select", SelectKBest(f_classif, k=n_select_tree)),
+                ("clf", RandomForestClassifier(
+                    n_estimators=400, max_depth=8, min_samples_leaf=5,
+                    class_weight="balanced", random_state=random_state, n_jobs=-1,
                 )),
             ])),
         ]
@@ -930,37 +1013,37 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
             n_jobs=1,
         )
     except ImportError:
-        logger.info("Voting requires LightGBM + XGBoost - skipping")
+        logger.info("Voting requires LightGBM - skipping")
 
-    # Stacking Ensemble (meta-learner)
+    # Stacking Ensemble (meta-learner) — LDA + SVM + LightGBM → LogReg
     try:
         from lightgbm import LGBMClassifier
-        from xgboost import XGBClassifier
 
         stack_estimators = [
             ("lda", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
                 ("clf", LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")),
             ])),
-            ("lr", Pipeline([
+            ("svm", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select)),
                 ("pca", PCA(n_components=n_pca, random_state=random_state)),
-                ("clf", LogisticRegression(
-                    max_iter=3000, solver="lbfgs", class_weight="balanced",
-                    C=0.1, random_state=random_state,
+                ("clf", SVC(
+                    kernel="rbf", C=5.0, gamma="scale",
+                    probability=True, class_weight="balanced",
+                    random_state=random_state,
                 )),
             ])),
             ("lgbm", Pipeline([
                 ("scaler", StandardScaler()),
-                ("select", SelectKBest(mutual_info_classif, k=n_select)),
+                ("select", SelectKBest(f_classif, k=n_select_tree)),
                 ("clf", LGBMClassifier(
-                    n_estimators=300, max_depth=4, learning_rate=0.03,
-                    class_weight="balanced", reg_alpha=1.0, reg_lambda=3.0,
-                    random_state=random_state,
-                    n_jobs=-1, verbose=-1,
+                    n_estimators=400, max_depth=5, learning_rate=0.02,
+                    subsample=0.8, colsample_bytree=0.6,
+                    class_weight="balanced", reg_alpha=0.5, reg_lambda=1.5,
+                    random_state=random_state, n_jobs=-1, verbose=-1,
                 )),
             ])),
         ]
@@ -975,7 +1058,7 @@ def get_classifiers(n_features: int, random_state: int = 42) -> dict[str, Pipeli
             n_jobs=1,
         )
     except ImportError:
-        logger.info("Stacking requires LightGBM + XGBoost - skipping")
+        logger.info("Stacking requires LightGBM - skipping")
 
     return clfs
 
