@@ -755,15 +755,22 @@ def extract_features(epochs: mne.Epochs) -> np.ndarray:
     ]
     valid_pairs = [(c1, c2) for c1, c2 in key_pairs
                    if c1 in ch_names and c2 in ch_names]
-    if valid_pairs and post_data.shape[2] >= 50:
+    if valid_pairs and n_times >= 100:
+        # Cap filter length to fit within the epoch (must be odd and < n_times)
+        plv_filter_len = int(sfreq * 0.8)  # 200 samples @ 250 Hz
+        plv_filter_len = min(plv_filter_len, n_times - 2)
+        if plv_filter_len % 2 == 0:
+            plv_filter_len -= 1
         for fmin_plv, fmax_plv in [(8, 13), (13, 30)]:
             try:
-                plv_filt = mne.filter.filter_data(
-                    post_data.astype(np.float64), sfreq, fmin_plv, fmax_plv,
-                    verbose=False,
+                # Filter the FULL epoch (more samples → stable filter), then slice
+                full_filt = mne.filter.filter_data(
+                    data.astype(np.float64), sfreq, fmin_plv, fmax_plv,
+                    filter_length=plv_filter_len, verbose=False,
                 )
+                plv_filt = full_filt[:, :, t0_sample:]  # post-stimulus only
                 analytic = scipy_hilbert(plv_filt, axis=2)
-                phase = np.angle(analytic)  # (n_epochs, n_channels, n_times)
+                phase = np.angle(analytic)  # (n_epochs, n_channels, n_post_times)
                 for c1_name, c2_name in valid_pairs:
                     ci = ch_names.index(c1_name)
                     cj = ch_names.index(c2_name)
